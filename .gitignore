@@ -1,0 +1,12 @@
+# Runtime files
+apple_assistant.lock
+apple_assistant.log
+.source_map
+launchd_stdout.log
+launchd_stderr.log
+
+# macOS
+.DS_Store
+
+# Claude Code
+.claude/
