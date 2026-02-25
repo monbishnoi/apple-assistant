@@ -1,7 +1,8 @@
 #!/bin/bash
 # apple_assistant.sh — Bi-directional sync between Apple Notes #act lines and Reminders
-# Scans Notes for #act items, deduplicates into Action List note, syncs to WORK reminders.
+# v2: Deduplicates Action List, adds clickable source note links, syncs to WORK reminders.
 # Completed reminders get marked #done in both Action List and source notes.
+# Action List is reorganized: #act on top, separator, #done on bottom.
 
 set -euo pipefail
 
@@ -56,36 +57,15 @@ trap release_lock EXIT
 
 # ── AppleScript helpers ──────────────────────────────────────────────────────
 
-# Scan all notes in the Actions folder for #act lines (skips Action List note).
-# Returns tab-separated: note_name<TAB>action_text
-scan_notes_for_actions() {
-    osascript <<'APPLESCRIPT'
-tell application "Notes"
-    set output to ""
-    try
-        set actionsFolder to folder "Actions"
-    on error
-        return ""
-    end try
-    repeat with n in notes of actionsFolder
-        if name of n is not "Action List" then
-            set noteTitle to name of n
-            set noteBody to plaintext of n
-            set AppleScript's text item delimiters to {linefeed, return}
-            set theLines to text items of noteBody
-            set AppleScript's text item delimiters to ""
-            repeat with aLine in theLines
-                set trimmed to aLine as text
-                if trimmed starts with "#act " then
-                    set actionText to text 6 thru -1 of trimmed
-                    set output to output & noteTitle & tab & actionText & linefeed
-                end if
-            end repeat
-        end if
-    end repeat
-    return output
-end tell
-APPLESCRIPT
+# Run the "compile action items" shortcut to populate the Action List note.
+compile_actions() {
+    log "Compile: running 'compile action items' shortcut"
+    if shortcuts run "compile action items" 2>/dev/null; then
+        log "Compile: shortcut completed successfully"
+    else
+        log "Compile: shortcut failed (exit code $?)"
+        return 1
+    fi
 }
 
 # Read the plaintext of the Action List note.
@@ -103,27 +83,32 @@ end tell
 APPLESCRIPT
 }
 
-# Append new actions to the Action List note (one per line as HTML divs).
-# Argument: newline-separated action texts
-append_to_action_list() {
-    local actions="$1"
-    [[ -z "$actions" ]] && return 0
-
-    local html=""
-    while IFS= read -r action; do
-        [[ -z "$action" ]] && continue
-        html="${html}<div>#act ${action}</div>"
-    done <<< "$actions"
-
-    [[ -z "$html" ]] && return 0
-
-    osascript -e "
-tell application \"Notes\"
-    set actionsFolder to folder \"Actions\"
-    set theNote to note \"Action List\" of actionsFolder
-    set body of theNote to (body of theNote) & \"$html\"
+# Read the HTML body of the Action List note.
+read_action_list_html() {
+    osascript <<'APPLESCRIPT'
+tell application "Notes"
+    try
+        set actionsFolder to folder "Actions"
+        set theNote to note "Action List" of actionsFolder
+        return body of theNote
+    on error
+        return ""
+    end try
 end tell
-"
+APPLESCRIPT
+}
+
+# Write HTML body to the Action List note from a temp file.
+write_action_list_html() {
+    local html_file="$1"
+    osascript <<APPLESCRIPT
+tell application "Notes"
+    set actionsFolder to folder "Actions"
+    set theNote to note "Action List" of actionsFolder
+    set newHTML to do shell script "cat '${html_file}'"
+    set body of theNote to newHTML
+end tell
+APPLESCRIPT
 }
 
 # Read all reminder names (completed and incomplete) from WORK list.
@@ -210,18 +195,272 @@ end tell
 "
 }
 
-# Mark #act → #done in the original source note.
-# Arguments: note_name, action_text
+# ── NEW v2: Build action→source note map ─────────────────────────────────────
+
+# Scan all notes in Actions folder for #act lines.
+# Returns tab-separated: action_text<TAB>note_name<TAB>note_id per line.
+build_action_source_map() {
+    osascript <<'APPLESCRIPT'
+tell application "Notes"
+    set actionsFolder to folder "Actions"
+    set output to ""
+    repeat with n in notes of actionsFolder
+        if name of n is not "Action List" then
+            set noteName to name of n
+            set noteID to id of n
+            set noteBody to plaintext of n
+            set AppleScript's text item delimiters to {linefeed, return}
+            set theLines to text items of noteBody
+            set AppleScript's text item delimiters to ""
+            repeat with aLine in theLines
+                set trimmed to aLine as text
+                if trimmed starts with "#act " then
+                    set actionText to text 6 thru -1 of trimmed
+                    set output to output & actionText & tab & noteName & tab & noteID & linefeed
+                end if
+            end repeat
+        end if
+    end repeat
+    return output
+end tell
+APPLESCRIPT
+}
+
+# ── NEW v2: Deduplicate Action List ──────────────────────────────────────────
+
+deduplicate_action_list() {
+    log "Dedup: removing duplicate lines from Action List"
+
+    local html_file result_file
+    html_file=$(mktemp)
+    result_file=$(mktemp)
+
+    read_action_list_html > "$html_file"
+
+    python3 - "$html_file" "$result_file" <<'PY'
+import re, sys
+
+with open(sys.argv[1]) as f:
+    html = f.read()
+
+# Match <div...>...</div> blocks
+divs = re.findall(r'<div[^>]*>.*?</div>', html, re.DOTALL | re.IGNORECASE)
+
+seen_keys = set()     # normalized keys for dedup
+seen_actions = set()  # action text only (lowered), for #act vs #done dedup
+unique = []
+
+def normalize(text):
+    """Normalize a line for dedup: strip [Source Note] brackets at end, lowercase."""
+    t = re.sub(r'\s*\[[^\]]*\]\s*$', '', text).strip()
+    return t.lower()
+
+for div in divs:
+    # Strip HTML tags to get text content
+    text = re.sub(r'<[^>]+>', '', div).strip()
+
+    if not text:
+        continue
+
+    # Skip old separators
+    if text == '---':
+        continue
+    if '<hr' in div.lower():
+        continue
+
+    key = normalize(text)
+
+    # Full line dedup (case-insensitive, ignoring bracket refs)
+    if key in seen_keys:
+        continue
+
+    # Cross-prefix dedup: if #done version exists, skip new #act version
+    if key.startswith('#act '):
+        action_base = key[5:].strip()
+        if '#done ' + action_base in seen_keys or action_base in seen_actions:
+            continue
+        seen_actions.add(action_base)
+    elif key.startswith('#done '):
+        action_base = key[6:].strip()
+        seen_actions.add(action_base)
+
+    seen_keys.add(key)
+    unique.append(div)
+
+with open(sys.argv[2], 'w') as f:
+    f.write('\n'.join(unique))
+PY
+
+    write_action_list_html "$result_file"
+    rm -f "$html_file" "$result_file"
+    log "Dedup: Action List deduplicated"
+}
+
+# ── NEW v2: Add source note references ───────────────────────────────────────
+
+# For each #act/#done line without a [Note Name] reference, find the source note
+# and append [Note Name] in brackets. (Apple Notes strips <a> tags, so we use
+# plain text brackets for source identification.)
+add_source_refs() {
+    log "Refs: adding source note references to Action List"
+
+    local source_map_file html_file result_file
+    source_map_file=$(mktemp)
+    html_file=$(mktemp)
+    result_file=$(mktemp)
+
+    build_action_source_map > "$source_map_file"
+    read_action_list_html > "$html_file"
+
+    python3 - "$html_file" "$source_map_file" "$result_file" <<'PY'
+import re, sys
+
+with open(sys.argv[1]) as f:
+    html = f.read()
+
+with open(sys.argv[2]) as f:
+    source_map_raw = f.read()
+
+# Build source map: list of (action_text, note_name)
+# Sorted by action_text length descending (longest match first)
+source_entries = []
+for line in source_map_raw.strip().split('\n'):
+    parts = line.split('\t')
+    if len(parts) >= 2:
+        action_text = parts[0].strip()
+        note_name = parts[1].strip()
+        if action_text:
+            source_entries.append((action_text, note_name))
+
+source_entries.sort(key=lambda x: len(x[0]), reverse=True)
+
+# Process each div in the HTML
+divs = re.findall(r'<div[^>]*>.*?</div>', html, re.DOTALL | re.IGNORECASE)
+processed = []
+
+for div in divs:
+    text = re.sub(r'<[^>]+>', '', div).strip()
+
+    # Skip if already has brackets (source ref already added)
+    if '[' in text:
+        processed.append(div)
+        continue
+
+    lower = text.lower()
+    if not (lower.startswith('#act ') or lower.startswith('#done ')):
+        processed.append(div)
+        continue
+
+    # Get the part after prefix
+    prefix_len = 5 if lower.startswith('#act ') else 6
+    action_part = text[prefix_len:].strip()
+    action_part_lower = action_part.lower()
+
+    # Try to match against source map
+    for action_text, note_name in source_entries:
+        at_lower = action_text.lower().strip()
+        nn_lower = note_name.lower().strip()
+
+        # Case 1: line is exactly the action text
+        if action_part_lower == at_lower:
+            prefix = text[:prefix_len]
+            new_content = f'{prefix}{action_text} [{note_name}]'
+            div_match = re.match(r'(<div[^>]*>)(.*?)(</div>)', div, re.DOTALL | re.IGNORECASE)
+            if div_match:
+                div = f'{div_match.group(1)}{new_content}{div_match.group(3)}'
+            break
+
+        # Case 2: line is action_text + " " + note_name (shortcut appended note name)
+        if action_part_lower == at_lower + ' ' + nn_lower:
+            prefix = text[:prefix_len]
+            new_content = f'{prefix}{action_text} [{note_name}]'
+            div_match = re.match(r'(<div[^>]*>)(.*?)(</div>)', div, re.DOTALL | re.IGNORECASE)
+            if div_match:
+                div = f'{div_match.group(1)}{new_content}{div_match.group(3)}'
+            break
+
+    processed.append(div)
+
+with open(sys.argv[3], 'w') as f:
+    f.write('\n'.join(processed))
+PY
+
+    write_action_list_html "$result_file"
+    rm -f "$source_map_file" "$html_file" "$result_file"
+    log "Refs: source note references updated"
+}
+
+# ── NEW v2: Reorganize Action List ───────────────────────────────────────────
+
+# Moves all #act items to top, adds a --- separator, then #done items below.
+reorganize_action_list() {
+    log "Reorg: reorganizing Action List (#act on top, #done on bottom)"
+
+    local html_file result_file
+    html_file=$(mktemp)
+    result_file=$(mktemp)
+
+    read_action_list_html > "$html_file"
+
+    python3 - "$html_file" "$result_file" <<'PY'
+import re, sys
+
+with open(sys.argv[1]) as f:
+    html = f.read()
+
+divs = re.findall(r'<div[^>]*>.*?</div>', html, re.DOTALL | re.IGNORECASE)
+
+title_divs = []
+act_divs = []
+done_divs = []
+other_divs = []
+
+for div in divs:
+    text = re.sub(r'<[^>]+>', '', div).strip().lower()
+    if not text or text == '---':
+        continue  # Skip empty lines and old separators
+    if '<hr' in div.lower():
+        continue  # Skip old <hr> separators
+    if '<b>' in div.lower() and 'action list' in text:
+        title_divs.append(div)
+    elif text.startswith('#act '):
+        act_divs.append(div)
+    elif text.startswith('#done '):
+        done_divs.append(div)
+    else:
+        other_divs.append(div)
+
+# Rebuild: title, #act items, other items, separator (if #done exists), #done items
+result = title_divs + act_divs + other_divs
+if done_divs:
+    result.append('<div>---</div>')
+    result.extend(done_divs)
+
+with open(sys.argv[2], 'w') as f:
+    f.write('\n'.join(result))
+PY
+
+    write_action_list_html "$result_file"
+    rm -f "$html_file" "$result_file"
+    log "Reorg: Action List reorganized"
+}
+
+# ── NEW v2: Mark done in source note ─────────────────────────────────────────
+
+# Find the source note by name and change #act to #done for a given action.
 mark_done_in_source_note() {
-    local note_name="$1"
-    local action="$2"
-    local escaped_name="${note_name//\"/\\\"}"
+    local action="$1"
+    local source_note_name="$2"
     local escaped_action="${action//\"/\\\"}"
+    local escaped_note="${source_note_name//\"/\\\"}"
+
+    log "Reverse sync: marking '#done' in source note '$source_note_name' for '$action'"
+
     osascript -e "
 tell application \"Notes\"
-    set actionsFolder to folder \"Actions\"
     try
-        set theNote to note \"${escaped_name}\" of actionsFolder
+        set actionsFolder to folder \"Actions\"
+        set theNote to note \"${escaped_note}\" of actionsFolder
         set noteHTML to body of theNote
         set oldTag to \"#act ${escaped_action}\"
         set newTag to \"#done ${escaped_action}\"
@@ -231,84 +470,58 @@ tell application \"Notes\"
         set body of theNote to parts as text
         set AppleScript's text item delimiters to \"\"
     on error errMsg
-        -- Note may have been deleted, skip
+        -- Note not found or action not found, skip
     end try
 end tell
-"
+" 2>/dev/null || log "Reverse sync: could not mark done in source note '$source_note_name'"
 }
 
-# ── Forward sync: Notes → Action List → Reminders ───────────────────────────
+# ── Forward sync: Action List → Reminders ────────────────────────────────────
 
 forward_sync() {
-    log "Forward sync: scanning notes for #act lines"
+    log "Forward sync: reading Action List for #act lines"
 
-    # 1. Scan all notes for #act lines
-    local raw_actions
-    raw_actions=$(scan_notes_for_actions)
+    # 1. Read Action List (already deduplicated and linked)
+    local action_list
+    action_list=$(read_action_list)
 
-    if [[ -z "$raw_actions" ]]; then
-        log "Forward sync: no #act lines found"
+    if [[ -z "$action_list" ]]; then
+        log "Forward sync: Action List is empty"
         return 0
     fi
 
-    # Parse into parallel arrays: source notes and action texts
-    declare -a source_notes=()
+    # 2. Extract #act lines from Action List, stripping source note reference
     declare -a action_texts=()
-    while IFS=$'\t' read -r note_name action_text; do
-        [[ -z "$action_text" ]] && continue
-        # Trim whitespace
-        action_text=$(echo "$action_text" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-        [[ -z "$action_text" ]] && continue
-        source_notes+=("$note_name")
-        action_texts+=("$action_text")
-    done <<< "$raw_actions"
+    while IFS= read -r line; do
+        line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if echo "$line" | grep -qi "^#act "; then
+            local action_text
+            action_text=$(echo "$line" | sed 's/^#[aA][cC][tT] //')
+            # Strip source note reference [Note Name] at end of line
+            action_text=$(echo "$action_text" | sed 's/ *\[[^]]*\]$//')
+            action_text=$(echo "$action_text" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            [[ -n "$action_text" ]] && action_texts+=("$action_text")
+        fi
+    done <<< "$action_list"
 
-    log "Forward sync: found ${#action_texts[@]} #act lines"
+    if [[ ${#action_texts[@]} -eq 0 ]]; then
+        log "Forward sync: no #act lines in Action List"
+        return 0
+    fi
 
-    # 2. Read existing Action List
-    local existing_list
-    existing_list=$(read_action_list)
+    log "Forward sync: found ${#action_texts[@]} #act lines in Action List"
 
     # 3. Read existing reminders (both completed and incomplete)
     local existing_reminders
     existing_reminders=$(read_reminders)
 
-    # 4. Deduplicate: find new actions not in Action List
-    local new_actions=""
+    # 4. Find actions that don't have a reminder yet
     local new_reminders=""
-    # Also save the source mapping for reverse sync
-    # Store source note → action mapping to a temp file for reverse sync
-    local source_map_file="$SCRIPT_DIR/.source_map"
-    : > "$source_map_file"
 
-    for i in "${!action_texts[@]}"; do
-        local action="${action_texts[$i]}"
-        local source="${source_notes[$i]}"
+    for action in "${action_texts[@]}"; do
         local action_lower
         action_lower=$(echo "$action" | tr '[:upper:]' '[:lower:]')
 
-        # Save source mapping (always, for reverse sync)
-        echo "${source}	${action}" >> "$source_map_file"
-
-        # Check if already in Action List (case-insensitive)
-        local in_list=false
-        while IFS= read -r line; do
-            local line_clean
-            line_clean=$(echo "$line" | sed 's/^#act //;s/^#done //' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            local line_lower
-            line_lower=$(echo "$line_clean" | tr '[:upper:]' '[:lower:]')
-            if [[ "$line_lower" == "$action_lower" ]]; then
-                in_list=true
-                break
-            fi
-        done <<< "$existing_list"
-
-        if [[ "$in_list" == false ]]; then
-            new_actions="${new_actions}${action}"$'\n'
-            log "Forward sync: new action: $action"
-        fi
-
-        # Check if reminder exists (case-insensitive, check both completed and incomplete)
         local has_reminder=false
         while IFS=$'\t' read -r rem_name rem_completed; do
             local rem_lower
@@ -325,20 +538,9 @@ forward_sync() {
     done
 
     # Remove trailing newlines
-    new_actions=$(echo "$new_actions" | sed '/^$/d')
     new_reminders=$(echo "$new_reminders" | sed '/^$/d')
 
-    # 5. Append new actions to Action List
-    if [[ -n "$new_actions" ]]; then
-        local count
-        count=$(echo "$new_actions" | wc -l | tr -d ' ')
-        log "Forward sync: appending $count new actions to Action List"
-        append_to_action_list "$new_actions"
-    else
-        log "Forward sync: no new actions to append"
-    fi
-
-    # 6. Create new reminders
+    # 5. Create new reminders
     if [[ -n "$new_reminders" ]]; then
         local count
         count=$(echo "$new_reminders" | wc -l | tr -d ' ')
@@ -349,7 +551,7 @@ forward_sync() {
     fi
 }
 
-# ── Reverse sync: Reminders → Action List → Notes ───────────────────────────
+# ── Reverse sync: Reminders → Action List → Source Notes ─────────────────────
 
 reverse_sync() {
     log "Reverse sync: checking for completed reminders"
@@ -362,7 +564,9 @@ reverse_sync() {
         return 0
     fi
 
-    local source_map_file="$SCRIPT_DIR/.source_map"
+    # Read Action List plaintext BEFORE marking done (to find source refs)
+    local action_list
+    action_list=$(read_action_list)
 
     while IFS= read -r rem_name; do
         [[ -z "$rem_name" ]] && continue
@@ -371,23 +575,47 @@ reverse_sync() {
 
         log "Reverse sync: '$rem_name' completed"
 
+        # Find source note reference from Action List
+        # Look for: #act <rem_name> [Source Note Name]
+        local source_note=""
+        while IFS= read -r al_line; do
+            al_line=$(echo "$al_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if echo "$al_line" | grep -qi "^#act "; then
+                local al_action
+                al_action=$(echo "$al_line" | sed 's/^#[aA][cC][tT] //')
+                # Extract source note name from brackets at end
+                local bracket_ref
+                bracket_ref=$(echo "$al_action" | grep -o '\[[^]]*\]$' | sed 's/^\[//;s/\]$//' || true)
+                # Strip bracket ref to get pure action text
+                local al_text
+                al_text=$(echo "$al_action" | sed 's/ *\[[^]]*\]$//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+                local al_lower rem_lower
+                al_lower=$(echo "$al_text" | tr '[:upper:]' '[:lower:]')
+                rem_lower=$(echo "$rem_name" | tr '[:upper:]' '[:lower:]')
+
+                if [[ "$al_lower" == "$rem_lower" ]]; then
+                    if [[ -n "$bracket_ref" ]]; then
+                        source_note="$bracket_ref"
+                    fi
+                    break
+                fi
+            fi
+        done <<< "$action_list"
+
         # Mark #done in Action List
         mark_done_in_action_list "$rem_name"
 
-        # Find source note and mark #done there
-        if [[ -f "$source_map_file" ]]; then
-            while IFS=$'\t' read -r src_note src_action; do
-                local src_lower rem_lower
-                src_lower=$(echo "$src_action" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                rem_lower=$(echo "$rem_name" | tr '[:upper:]' '[:lower:]')
-                if [[ "$src_lower" == "$rem_lower" ]]; then
-                    log "Reverse sync: marking #done in source note '$src_note'"
-                    mark_done_in_source_note "$src_note" "$src_action"
-                    break
-                fi
-            done < "$source_map_file"
+        # Mark #done in source note if found
+        if [[ -n "$source_note" ]]; then
+            mark_done_in_source_note "$rem_name" "$source_note"
+        else
+            log "Reverse sync: no source note reference found for '$rem_name'"
         fi
     done <<< "$completed"
+
+    # Reorganize Action List: #act on top, separator, #done on bottom
+    reorganize_action_list
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -395,12 +623,28 @@ reverse_sync() {
 main() {
     rotate_log
     acquire_lock
-    log "=== Apple Assistant sync started ==="
+    log "=== Apple Assistant v2 sync started ==="
 
+    # Step 1: Run shortcut to compile #act lines into Action List
+    if [[ "${SKIP_COMPILE:-}" != "1" ]]; then
+        compile_actions
+    else
+        log "Compile: skipped (SKIP_COMPILE=1)"
+    fi
+
+    # Step 2: Deduplicate Action List
+    deduplicate_action_list
+
+    # Step 3: Add source note references [Note Name]
+    add_source_refs
+
+    # Step 4: Forward sync — Action List → Reminders
     forward_sync
+
+    # Step 5: Reverse sync — Reminders → Action List → Source Notes + Reorganize
     reverse_sync
 
-    log "=== Apple Assistant sync completed ==="
+    log "=== Apple Assistant v2 sync completed ==="
 }
 
 main "$@"
